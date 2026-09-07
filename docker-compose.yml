@@ -1,0 +1,75 @@
+# PublicAgent AI — one command to run the whole stack:
+#   cp .env.example .env   (fill in GROQ_API_KEY + OPENROUTER_API_KEY)
+#   docker compose up --build
+services:
+  postgres:
+    image: pgvector/pgvector:pg16
+    environment:
+      POSTGRES_USER: publicagent
+      POSTGRES_PASSWORD: publicagent
+      POSTGRES_DB: publicagent
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U publicagent"]
+      interval: 5s
+      timeout: 5s
+      retries: 10
+
+  backend:
+    build: ./backend
+    environment:
+      DATABASE_URL: postgresql+psycopg://publicagent:publicagent@postgres:5432/publicagent
+      # --- LLM provider --------------------------------------------------
+      # Default: groq (Groq chat + OpenRouter embeddings).
+      # Fallbacks: model_studio (Alibaba Qwen), openai_compatible, mock.
+      LLM_PROVIDER: ${LLM_PROVIDER:-groq}
+      LLM_MODEL_NAME: ${LLM_MODEL_NAME:-qwen-plus}
+      # --- Groq (used when LLM_PROVIDER=groq) ----------------------------
+      GROQ_API_KEY: ${GROQ_API_KEY:-}
+      GROQ_BASE_URL: ${GROQ_BASE_URL:-https://api.groq.com/openai/v1}
+      GROQ_MODEL_NAME: ${GROQ_MODEL_NAME:-qwen/qwen3-32b}
+      # --- OpenRouter (embeddings when LLM_PROVIDER=groq) ----------------
+      OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+      OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+      EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-nvidia/nemotron-3-embed-1b:free}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
+      # --- Aliyun Model Studio (fallback provider, unused in default) ----
+      DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+      # --- Auth ----------------------------------------------------------
+      JWT_SECRET: ${JWT_SECRET:-change-me-in-production}
+      JWT_EXPIRE_MINUTES: ${JWT_EXPIRE_MINUTES:-60}
+      # --- Background follow-up checks -----------------------------------
+      FOLLOWUP_CHECK_INTERVAL_SECONDS: ${FOLLOWUP_CHECK_INTERVAL_SECONDS:-120}
+      # --- File storage --------------------------------------------------
+      FILE_STORAGE_BACKEND: local
+      FILE_STORAGE_LOCAL_DIR: /data/uploads
+      MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
+      FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
+      ENV: production
+      SEED_ON_START: "1"
+      # --- Mock gov registry persistence ---------------------------------
+      MOCK_STORE_PATH: /data/appdata/mock_gov_store.json
+    volumes:
+      - uploads:/data/uploads
+      - mockstore:/data/appdata
+    depends_on:
+      postgres:
+        condition: service_healthy
+    ports:
+      - "8000:8000"
+
+  frontend:
+    build:
+      context: ./frontend
+      args:
+        API_ORIGIN: "http://localhost:8000"
+    ports:
+      - "5173:80"
+    depends_on:
+      - backend
+
+volumes:
+  pgdata:
+  uploads:
+  mockstore:

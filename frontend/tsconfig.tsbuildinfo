@@ -1,0 +1,1 @@
+{"root":["./src/App.tsx","./src/main.tsx","./src/api/client.ts","./src/components/dashboard/NotificationBell.tsx","./src/components/ui-cards/index.tsx","./src/components/workflow-graph/WorkflowPanel.tsx","./src/pages/Chat.tsx","./src/pages/ComplaintDetail.tsx","./src/pages/Dashboard.tsx","./src/pages/Login.tsx","./src/state/AuthContext.tsx"],"version":"5.9.3"}
