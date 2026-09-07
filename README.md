@@ -83,7 +83,7 @@ rule-based LLM engine so the whole demo runs with zero API keys (CI, judge lapto
 offline demos). Switch to `model_studio` with a `DASHSCOPE_API_KEY` to use Qwen; no
 other code changes are needed (the agent only ever calls the `LLMClient` interface).
 
-## The demo script (what to show judges)
+## The demo script 
 
 1. Log in with **Continue as Demo Citizen**.
 2. Type: *"A police officer misbehaved with me."*
