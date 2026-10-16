@@ -10,6 +10,7 @@ services:
       POSTGRES_DB: publicagent
     volumes:
       - pgdata:/var/lib/postgresql/data
+      - ./init.sql:/docker-entrypoint-initdb.d/init.sql
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U publicagent"]
       interval: 5s
@@ -47,7 +48,7 @@ services:
       MAX_UPLOAD_MB: ${MAX_UPLOAD_MB:-10}
       FRONTEND_ORIGIN: ${FRONTEND_ORIGIN:-http://localhost:5173}
       ENV: production
-      SEED_ON_START: "1"
+      SEED_ON_START: "0"
       # --- Mock gov registry persistence ---------------------------------
       MOCK_STORE_PATH: /data/appdata/mock_gov_store.json
     volumes:
