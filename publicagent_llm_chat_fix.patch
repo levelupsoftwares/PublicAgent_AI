@@ -1,0 +1,289 @@
+diff --git a/.gitignore b/.gitignore
+index 111978c..d8bbe0a 100755
+--- a/.gitignore
++++ b/.gitignore
+@@ -21,8 +21,10 @@ uploads/
+ mock_gov_store.json
+ 
+ # Workspace noise (not part of the deliverable)
++# NOTE: anchor these to the repo root — a bare "scripts/" also ignored
++# backend/app/scripts/ and silently excluded seed_demo_data.py from pushes.
+ download/
+-scripts/
++/scripts/
+ skills/
+ tool-results/
+ upload/
+diff --git a/backend/app/agent/nodes/authority.py b/backend/app/agent/nodes/authority.py
+index 99490ab..585e5a5 100755
+--- a/backend/app/agent/nodes/authority.py
++++ b/backend/app/agent/nodes/authority.py
+@@ -7,7 +7,7 @@ from app.agent.events import (
+     OFFICIAL_DATA_RETRIEVED,
+     REQUIREMENTS_IDENTIFIED,
+ )
+-from app.agent.nodes.base import Services, emit, say
++from app.agent.nodes.base import Services, emit, llm_prose, say
+ from app.agent.state import AgentState
+ 
+ ISSUE_LABELS = {
+@@ -113,14 +113,36 @@ def make_present_options(services: Services):
+         issue_type = state.get("issue_type") or "general_grievance"
+         auth = (state.get("government_data") or {}).get("authority", {}) or {}
+         label = ISSUE_LABELS.get(issue_type, issue_type)
+-        prose = (
++        context = state.get("official_context") or []
++        context_text = "\n\n".join(
++            f"[{c.get('title', 'source')}] {(c.get('content') or '')[:400]}"
++            for c in context[:3]
++        ) or "(no retrieved context)"
++        authority_name = auth.get("name") or "a complaints authority"
++
++        template_prose = (
+             f"Thank you for telling me about this. What you described sounds like it may be "
+             f"{label}. I'm not a court and I'm not deciding anything — I can only help you "
+             f"understand typical options and, if you choose, prepare a complaint. "
+             f"Based on the (demo) guidance I retrieved, issues like this are usually handled by "
+-            f"an authority such as {auth.get('name') or 'a complaints authority'} "
++            f"an authority such as {authority_name} "
+             f"(demo data — not a verified real institution)."
+         )
++        prose = llm_prose(
++            services, state, template_prose,
++            system=(
++                "[TASK: present_options] You are PublicAgent, a neutral GovTech complaint "
++                "assistant for Pakistan. Write a short, warm, plain-language reply "
++                "(3-6 sentences, no lists, no markdown headings) that: (1) acknowledges in "
++                "your own words what the citizen described, (2) notes neutrally that it may "
++                f"be {label} — without judging who is right and without claiming any "
++                f"wrongdoing occurred, (3) mentions that issues like this are typically "
++                f"handled by an authority such as '{authority_name}' (demo data, not a "
++                "verified real institution), and (4) reassures them the option buttons "
++                "below carry no commitment — they can explore freely.\n\n"
++                f"RETRIEVED DEMO CONTEXT (use only if helpful):\n{context_text}"
++            ),
++        )
+         sources = [
+             {"title": c.get("title"), "source_ref": c.get("source_ref")}
+             for c in (state.get("official_context") or [])[:4]
+diff --git a/backend/app/agent/nodes/base.py b/backend/app/agent/nodes/base.py
+index 5e316d7..073dc1e 100755
+--- a/backend/app/agent/nodes/base.py
++++ b/backend/app/agent/nodes/base.py
+@@ -34,6 +34,26 @@ def say(state: AgentState, content: str, card: dict | None = None) -> dict:
+     return {"assistant_messages": [msg]}
+ 
+ 
++def llm_prose(services: Services, state: AgentState, fallback: str, system: str) -> str:
++    """Ask the active LLM to write natural reply prose for a node.
++
++    Nodes previously hardcoded every user-visible sentence, which made even a
++    fully-working Groq deployment look like canned output. This helper lets the
++    configured provider write the wording, while keeping the deterministic
++    template as a safe fallback whenever the LLM is unavailable (offline mock,
++    invalid/missing key, network error, empty completion).
++    """
++    try:
++        resp = services.llm.generate(
++            [{"role": "user", "content": (state.get("user_request") or "")[:1500]}],
++            system=system,
++        )
++        text = (resp.content or "").strip()
++        return text or fallback
++    except Exception:
++        return fallback
++
++
+ def add_error(state: AgentState, message: str) -> dict:
+     return {"errors": [message]}
+ 
+diff --git a/backend/app/agent/nodes/guidance.py b/backend/app/agent/nodes/guidance.py
+index fdc2193..5ff18fc 100755
+--- a/backend/app/agent/nodes/guidance.py
++++ b/backend/app/agent/nodes/guidance.py
+@@ -6,7 +6,7 @@ Added to the spec's node list to implement §2's Understand-My-Options behaviour
+ from __future__ import annotations
+ 
+ from app.agent.events import make_event
+-from app.agent.nodes.base import Services, say
++from app.agent.nodes.base import Services, llm_prose, say
+ from app.agent.state import AgentState
+ 
+ ISSUE_LABELS = {
+@@ -63,14 +63,35 @@ def make_present_guidance(services: Services):
+             "disclaimer": "Neutral, informational guidance only — not legal advice, not a "
+                           "legal conclusion. All guidance is illustrative demo content.",
+         }
+-        if mode == "understand":
+-            prose = ("Here's a neutral overview of how this kind of situation is usually "
+-                     "handled. Take your time — none of this commits you to anything, and "
+-                     "filing is only one of the paths available.")
+-        else:
+-            prose = ("Being unsure is completely normal. Here's the lay of the land — when "
+-                     "you're ready, I can help you file a formal complaint, or we can just "
+-                     "talk through what happened.")
++        context_text = "\n\n".join(
++            f"[{c.get('title', 'source')}] {(c.get('content') or '')[:400]}"
++            for c in context[:3]
++        ) or "(no retrieved context)"
++
++        fallback_understand = (
++            "Here's a neutral overview of how this kind of situation is usually "
++            "handled. Take your time — none of this commits you to anything, and "
++            "filing is only one of the paths available.")
++        fallback_not_sure = (
++            "Being unsure is completely normal. Here's the lay of the land — when "
++            "you're ready, I can help you file a formal complaint, or we can just "
++            "talk through what happened.")
++        template_prose = fallback_understand if mode == "understand" else fallback_not_sure
++        prose = llm_prose(
++            services, state, template_prose,
++            system=(
++                "[TASK: present_guidance] You are PublicAgent, a neutral GovTech "
++                "complaint assistant for Pakistan. The citizen asked for guidance "
++                f"about {label} (mode: {'they want to understand their options' if mode == 'understand' else 'they are not sure what to do'}). "
++                "Write a short, empathetic, plain-language reply (3-6 sentences, no "
++                "lists, no markdown headings): acknowledge their situation in your own "
++                "words, summarise the neutral overview below WITHOUT judging who is "
++                "right, and reassure them that a structured overview with sources "
++                "appears alongside your message. Never claim wrongdoing occurred and "
++                "never give legal advice.\n\n"
++                f"NEUTRAL OVERVIEW FROM THE DEMO KNOWLEDGE BASE:\n{context_text}"
++            ),
++        )
+         out = say(state, prose, card)
+         out["assistant_messages"] = out["assistant_messages"] + [{
+             "content": "",
+diff --git a/backend/app/api/routes.py b/backend/app/api/routes.py
+index 41caeb4..83e359e 100755
+--- a/backend/app/api/routes.py
++++ b/backend/app/api/routes.py
+@@ -22,6 +22,7 @@ from app.models import (
+ )
+ from app.parsing import gov_message_parser as parser
+ from app.schemas import (
++    ChatRequest,
+     ChatResponse,
+     ComplaintDetailOut,
+     ComplaintOut,
+@@ -40,21 +41,17 @@ ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".pdf"}
+ # ----------------------------------------------------------------- chat
+ @api_router.post("/api/chat", response_model=ChatResponse, tags=["chat"])
+ def chat_endpoint(
+-    payload: dict,
++    payload: ChatRequest,
+     user: User = Depends(get_current_user),
+     db: Session = Depends(get_db),
+ ):
+     from app.api.chat import run_chat_turn
+-    from app.schemas import ChatRequest
++    from app.llm.client import get_llm_client
+ 
+-    try:
+-        body = ChatRequest(**payload)
+-    except Exception as e:
+-        raise HTTPException(422, f"Invalid request: {e}")
+     try:
+         conv_id, messages, events, phase = run_chat_turn(
+-            db, user, body.conversation_id, body.content,
+-            body.action.model_dump() if body.action else None,
++            db, user, payload.conversation_id, payload.content,
++            payload.action.model_dump() if payload.action else None,
+         )
+     except LookupError as e:
+         raise HTTPException(404, str(e))
+@@ -65,6 +62,7 @@ def chat_endpoint(
+         messages=[MessageOut(**_message_out(m)) for m in messages],
+         workflow_events=events,
+         agent_phase=phase,
++        llm_provider=get_llm_client().provider_name,
+     )
+ 
+ 
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 46303ad..0f8586a 100755
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -27,6 +27,13 @@ logger = logging.getLogger("publicagent")
+ 
+ 
+ def _startup() -> None:
++    # Announce the ACTIVE LLM provider on every boot. The silent
++    # missing-key fallback to the offline mock was previously easy to miss —
++    # this line makes the active engine impossible to overlook.
++    from app.llm.client import get_llm_client
++
++    logger.info("Active LLM provider: %s", get_llm_client().provider_name)
++
+     # Import models so metadata is populated, then create tables.
+     import app.models  # noqa: F401
+     from sqlalchemy import inspect
+diff --git a/backend/app/schemas/__init__.py b/backend/app/schemas/__init__.py
+index 6c426b1..d99f3ad 100755
+--- a/backend/app/schemas/__init__.py
++++ b/backend/app/schemas/__init__.py
+@@ -59,6 +59,10 @@ class ChatResponse(BaseModel):
+     messages: list[MessageOut]
+     workflow_events: list[dict]
+     agent_phase: str
++    # Which engine produced this reply ("groq", "model_studio", "mock", ...).
++    # Lets the UI (and debugging) show whether a real LLM or the offline demo
++    # engine answered — silent mock fallbacks were previously undetectable.
++    llm_provider: str = ""
+ 
+ 
+ class ComplaintOut(BaseModel):
+diff --git a/backend/app/scripts/__init__.py b/backend/app/scripts/__init__.py
+new file mode 100644
+index 0000000..4145b27
+--- /dev/null
++++ b/backend/app/scripts/__init__.py
+@@ -0,0 +1,6 @@
++"""One-off / first-boot scripts (demo seeding, maintenance tasks).
++
++This package was referenced by app.main (SEED_ON_START=1) but missing from the
++repository, which crashed startup with ModuleNotFoundError. Restored as a
++safe stub: seeding is optional demo behaviour, so skipping is always valid.
++"""
+diff --git a/backend/app/scripts/seed_demo_data.py b/backend/app/scripts/seed_demo_data.py
+new file mode 100644
+index 0000000..dc25da6
+--- /dev/null
++++ b/backend/app/scripts/seed_demo_data.py
+@@ -0,0 +1,20 @@
++"""Seed demo data on first boot (SEED_ON_START=1).
++
++The original module was never pushed to the repository; this restored stub is a
++no-op so that `from app.scripts.seed_demo_data import seed_if_empty` in
++app.main works regardless of the SEED_ON_START value. The demo is already fully
++functional without seeded rows: the knowledge base is ingested separately at
++startup (app.rag.ingest.ingest_kb) and the demo user is ensured by
++app.api.auth.ensure_demo_user.
++"""
++from __future__ import annotations
++
++import logging
++
++logger = logging.getLogger("publicagent.seed")
++
++
++def seed_if_empty(db=None) -> bool:
++    """Return True if demo data was created. Stub: nothing to create."""
++    logger.info("seed_if_empty: stub — no demo seeding required (skipping)")
++    return False
+diff --git a/docker-compose.yml b/docker-compose.yml
+index faef5f5..8323e23 100755
+--- a/docker-compose.yml
++++ b/docker-compose.yml
+@@ -34,7 +34,10 @@ services:
+       OPENROUTER_API_KEY: ${OPENROUTER_API_KEY:-}
+       OPENROUTER_BASE_URL: ${OPENROUTER_BASE_URL:-https://openrouter.ai/api/v1}
+       EMBEDDING_MODEL_NAME: ${EMBEDDING_MODEL_NAME:-nvidia/nemotron-3-embed-1b:free}
+-      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
++      # IMPORTANT: nemotron-3-embed-1b outputs 2048-dim vectors. Keep this at
++      # 2048 unless you switch to a different embedding model, and wipe the
++      # pgdata volume (docker compose down -v) when changing the dimension.
++      EMBEDDING_DIM: ${EMBEDDING_DIM:-2048}
+       # --- Aliyun Model Studio (fallback provider, unused in default) ----
+       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
+       # --- Auth ----------------------------------------------------------

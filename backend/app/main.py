@@ -56,7 +56,7 @@ def _startup() -> None:
 
     import os
 
-    if os.environ.get("SEED_ON_START", "1") not in ("0", "false", "False"):
+    if os.environ.get("SEED_ON_START", "0") not in ("0", "false", "False"):
         from app.scripts.seed_demo_data import seed_if_empty
 
         seeded = seed_if_empty()
