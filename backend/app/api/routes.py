@@ -22,6 +22,7 @@ from app.models import (
 )
 from app.parsing import gov_message_parser as parser
 from app.schemas import (
+    ChatRequest,
     ChatResponse,
     ComplaintDetailOut,
     ComplaintOut,
@@ -40,21 +41,17 @@ ALLOWED_EXT = {".jpg", ".jpeg", ".png", ".pdf"}
 # ----------------------------------------------------------------- chat
 @api_router.post("/api/chat", response_model=ChatResponse, tags=["chat"])
 def chat_endpoint(
-    payload: dict,
+    payload: ChatRequest,
     user: User = Depends(get_current_user),
     db: Session = Depends(get_db),
 ):
     from app.api.chat import run_chat_turn
-    from app.schemas import ChatRequest
+    from app.llm.client import get_llm_client
 
     try:
-        body = ChatRequest(**payload)
-    except Exception as e:
-        raise HTTPException(422, f"Invalid request: {e}")
-    try:
         conv_id, messages, events, phase = run_chat_turn(
-            db, user, body.conversation_id, body.content,
-            body.action.model_dump() if body.action else None,
+            db, user, payload.conversation_id, payload.content,
+            payload.action.model_dump() if payload.action else None,
         )
     except LookupError as e:
         raise HTTPException(404, str(e))
@@ -65,6 +62,7 @@ def chat_endpoint(
         messages=[MessageOut(**_message_out(m)) for m in messages],
         workflow_events=events,
         agent_phase=phase,
+        llm_provider=get_llm_client().provider_name,
     )
 
 

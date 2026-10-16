@@ -34,6 +34,26 @@ def say(state: AgentState, content: str, card: dict | None = None) -> dict:
     return {"assistant_messages": [msg]}
 
 
+def llm_prose(services: Services, state: AgentState, fallback: str, system: str) -> str:
+    """Ask the active LLM to write natural reply prose for a node.
+
+    Nodes previously hardcoded every user-visible sentence, which made even a
+    fully-working Groq deployment look like canned output. This helper lets the
+    configured provider write the wording, while keeping the deterministic
+    template as a safe fallback whenever the LLM is unavailable (offline mock,
+    invalid/missing key, network error, empty completion).
+    """
+    try:
+        resp = services.llm.generate(
+            [{"role": "user", "content": (state.get("user_request") or "")[:1500]}],
+            system=system,
+        )
+        text = (resp.content or "").strip()
+        return text or fallback
+    except Exception:
+        return fallback
+
+
 def add_error(state: AgentState, message: str) -> dict:
     return {"errors": [message]}
 

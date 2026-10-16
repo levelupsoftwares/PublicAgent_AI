@@ -27,6 +27,13 @@ logger = logging.getLogger("publicagent")
 
 
 def _startup() -> None:
+    # Announce the ACTIVE LLM provider on every boot. The silent
+    # missing-key fallback to the offline mock was previously easy to miss —
+    # this line makes the active engine impossible to overlook.
+    from app.llm.client import get_llm_client
+
+    logger.info("Active LLM provider: %s", get_llm_client().provider_name)
+
     # Import models so metadata is populated, then create tables.
     import app.models  # noqa: F401
     from sqlalchemy import inspect

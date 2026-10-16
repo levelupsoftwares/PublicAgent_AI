@@ -21,8 +21,10 @@ uploads/
 mock_gov_store.json
 
 # Workspace noise (not part of the deliverable)
+# NOTE: anchor these to the repo root — a bare "scripts/" also ignored
+# backend/app/scripts/ and silently excluded seed_demo_data.py from pushes.
 download/
-scripts/
+/scripts/
 skills/
 tool-results/
 upload/

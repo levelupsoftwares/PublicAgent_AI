@@ -6,7 +6,7 @@ Added to the spec's node list to implement §2's Understand-My-Options behaviour
 from __future__ import annotations
 
 from app.agent.events import make_event
-from app.agent.nodes.base import Services, say
+from app.agent.nodes.base import Services, llm_prose, say
 from app.agent.state import AgentState
 
 ISSUE_LABELS = {
@@ -63,14 +63,35 @@ def make_present_guidance(services: Services):
             "disclaimer": "Neutral, informational guidance only — not legal advice, not a "
                           "legal conclusion. All guidance is illustrative demo content.",
         }
-        if mode == "understand":
-            prose = ("Here's a neutral overview of how this kind of situation is usually "
-                     "handled. Take your time — none of this commits you to anything, and "
-                     "filing is only one of the paths available.")
-        else:
-            prose = ("Being unsure is completely normal. Here's the lay of the land — when "
-                     "you're ready, I can help you file a formal complaint, or we can just "
-                     "talk through what happened.")
+        context_text = "\n\n".join(
+            f"[{c.get('title', 'source')}] {(c.get('content') or '')[:400]}"
+            for c in context[:3]
+        ) or "(no retrieved context)"
+
+        fallback_understand = (
+            "Here's a neutral overview of how this kind of situation is usually "
+            "handled. Take your time — none of this commits you to anything, and "
+            "filing is only one of the paths available.")
+        fallback_not_sure = (
+            "Being unsure is completely normal. Here's the lay of the land — when "
+            "you're ready, I can help you file a formal complaint, or we can just "
+            "talk through what happened.")
+        template_prose = fallback_understand if mode == "understand" else fallback_not_sure
+        prose = llm_prose(
+            services, state, template_prose,
+            system=(
+                "[TASK: present_guidance] You are PublicAgent, a neutral GovTech "
+                "complaint assistant for Pakistan. The citizen asked for guidance "
+                f"about {label} (mode: {'they want to understand their options' if mode == 'understand' else 'they are not sure what to do'}). "
+                "Write a short, empathetic, plain-language reply (3-6 sentences, no "
+                "lists, no markdown headings): acknowledge their situation in your own "
+                "words, summarise the neutral overview below WITHOUT judging who is "
+                "right, and reassure them that a structured overview with sources "
+                "appears alongside your message. Never claim wrongdoing occurred and "
+                "never give legal advice.\n\n"
+                f"NEUTRAL OVERVIEW FROM THE DEMO KNOWLEDGE BASE:\n{context_text}"
+            ),
+        )
         out = say(state, prose, card)
         out["assistant_messages"] = out["assistant_messages"] + [{
             "content": "",

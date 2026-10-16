@@ -59,6 +59,10 @@ class ChatResponse(BaseModel):
     messages: list[MessageOut]
     workflow_events: list[dict]
     agent_phase: str
+    # Which engine produced this reply ("groq", "model_studio", "mock", ...).
+    # Lets the UI (and debugging) show whether a real LLM or the offline demo
+    # engine answered — silent mock fallbacks were previously undetectable.
+    llm_provider: str = ""
 
 
 class ComplaintOut(BaseModel):

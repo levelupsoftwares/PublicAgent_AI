@@ -7,7 +7,7 @@ from app.agent.events import (
     OFFICIAL_DATA_RETRIEVED,
     REQUIREMENTS_IDENTIFIED,
 )
-from app.agent.nodes.base import Services, emit, say
+from app.agent.nodes.base import Services, emit, llm_prose, say
 from app.agent.state import AgentState
 
 ISSUE_LABELS = {
@@ -113,13 +113,35 @@ def make_present_options(services: Services):
         issue_type = state.get("issue_type") or "general_grievance"
         auth = (state.get("government_data") or {}).get("authority", {}) or {}
         label = ISSUE_LABELS.get(issue_type, issue_type)
-        prose = (
+        context = state.get("official_context") or []
+        context_text = "\n\n".join(
+            f"[{c.get('title', 'source')}] {(c.get('content') or '')[:400]}"
+            for c in context[:3]
+        ) or "(no retrieved context)"
+        authority_name = auth.get("name") or "a complaints authority"
+
+        template_prose = (
             f"Thank you for telling me about this. What you described sounds like it may be "
             f"{label}. I'm not a court and I'm not deciding anything — I can only help you "
             f"understand typical options and, if you choose, prepare a complaint. "
             f"Based on the (demo) guidance I retrieved, issues like this are usually handled by "
-            f"an authority such as {auth.get('name') or 'a complaints authority'} "
+            f"an authority such as {authority_name} "
             f"(demo data — not a verified real institution)."
+        )
+        prose = llm_prose(
+            services, state, template_prose,
+            system=(
+                "[TASK: present_options] You are PublicAgent, a neutral GovTech complaint "
+                "assistant for Pakistan. Write a short, warm, plain-language reply "
+                "(3-6 sentences, no lists, no markdown headings) that: (1) acknowledges in "
+                "your own words what the citizen described, (2) notes neutrally that it may "
+                f"be {label} — without judging who is right and without claiming any "
+                f"wrongdoing occurred, (3) mentions that issues like this are typically "
+                f"handled by an authority such as '{authority_name}' (demo data, not a "
+                "verified real institution), and (4) reassures them the option buttons "
+                "below carry no commitment — they can explore freely.\n\n"
+                f"RETRIEVED DEMO CONTEXT (use only if helpful):\n{context_text}"
+            ),
         )
         sources = [
             {"title": c.get("title"), "source_ref": c.get("source_ref")}
