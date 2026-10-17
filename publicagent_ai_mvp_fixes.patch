@@ -1,0 +1,1005 @@
+diff --git a/.env.example b/.env.example
+index 3d63075..b642af6 100755
+--- a/.env.example
++++ b/.env.example
+@@ -21,6 +21,7 @@ DATABASE_URL=postgresql+psycopg://publicagent:publicagent@postgres:5432/publicag
+ 
+ # --- LLM provider -------------------------------------------------------------
+ # groq               = Groq chat (qwen3-32b) + OpenRouter embeddings  <- default
++# gemini             = Google Gemini chat + Gemini embeddings
+ # model_studio      = Alibaba Cloud Model Studio (Qwen, OpenAI-compatible)
+ # openai_compatible = any generic OpenAI-compatible endpoint
+ # mock              = deterministic offline engine (no API key needed)
+@@ -45,6 +46,21 @@ EMBEDDING_MODEL_NAME=nvidia/nemotron-3-embed-1b:free
+ #     the kb_chunks.embedding column at the new width on first boot.
+ EMBEDDING_DIM=1024
+ 
++# --- Google Gemini (chat + embeddings, or embeddings only) ---------------------
++# Get a key at https://aistudio.google.com/apikey
++# Option A — Gemini for EVERYTHING:  LLM_PROVIDER=gemini  (+ GEMINI_API_KEY)
++# Option B — keep Groq chat, Gemini ONLY for embeddings:
++#     EMBEDDING_PROVIDER=gemini  (+ GEMINI_API_KEY)
++GEMINI_API_KEY=
++GEMINI_BASE_URL=https://generativelanguage.googleapis.com/v1beta
++GEMINI_CHAT_MODEL=gemini-2.0-flash
++GEMINI_EMBEDDING_MODEL=gemini-embedding-001
++# Embedding override: "" = follow LLM_PROVIDER; "gemini" = always Gemini.
++EMBEDDING_PROVIDER=
++# With Gemini embeddings set EMBEDDING_DIM above to 1536 (or 768 / 3072 —
++# gemini-embedding-001 supports Matryoshka truncation). Changing the
++# dimension later is safe: the backend wipes and re-embeds the KB on boot.
++
+ # --- Aliyun Model Studio (only used if LLM_PROVIDER=model_studio) -------------
+ DASHSCOPE_API_KEY=
+ DASHSCOPE_BASE_URL=https://dashscope.aliyuncs.com/compatible-mode/v1
+diff --git a/DECISIONS.md b/DECISIONS.md
+index 2909f6a..3e471b1 100755
+--- a/DECISIONS.md
++++ b/DECISIONS.md
+@@ -142,3 +142,25 @@ decided and why*.
+   Urdu/localisation, admin portal — all out of MVP scope per spec §A exclusions.
+ - Browser E2E tests skipped per spec §19; the API-level integration test covers
+   the full journey instead.
++
++## Post-review fixes (MVP patch 2)
++
++25. **Google Gemini provider** (`app/llm/gemini_adapter.py`): REST over httpx (no
++    new SDK dependency). Two modes via `.env` only — `LLM_PROVIDER=gemini`
++    (chat + embeddings from one key) or `EMBEDDING_PROVIDER=gemini` (Gemini
++    embeddings with any other chat provider; surfaces as e.g.
++    `groq+gemini-embed` in the boot log and `/api/health`). Embeddings always
++    request `outputDimensionality = EMBEDDING_DIM` (clamped to ≥768) so stored
++    widths stay aligned with the pgvector column / brute-force cosine.
++26. **`seed_demo_data.py` was empty** — `main.py` imports `seed_if_empty()` at
++    boot, so the app crashed with ImportError on start. The module now seeds
++    (idempotently): the demo citizen, the KB, 3 complaints across the mock
++    lifecycle (registered in the mock gov case store so tracking works),
++    complaint events, notifications, one pending follow-up job and 2 demo
++    conversations. `SEED_ON_START` failures no longer block boot (logged and
++    skipped instead).
++27. **Embedding-dimension drift self-heal** (`reingest_if_dim_changed`): when
++    the embedding provider/model/dimension changes, old KB chunks have the
++    wrong width — SQLite silently returns empty RAG results, pgvector raises
++    dimension-mismatch errors. Startup now detects the drift, wipes and
++    re-embeds the KB automatically (PostgreSQL column is recreated).
+diff --git a/README.md b/README.md
+index 7392856..b12f1a8 100755
+--- a/README.md
++++ b/README.md
+@@ -52,6 +52,35 @@ Out of the box the `.env` is wired for `LLM_PROVIDER=groq`:
+ > volume (`docker compose down -v`) so the `kb_chunks.embedding` column is
+ > recreated at the new width on first boot.
+ 
++### Google Gemini (chat + embeddings)
++
++Gemini is supported in two modes — both configured purely via `.env`:
++
++1. **Gemini for everything** — dynamic chat replies AND embeddings from one
++   key ([get a key](https://aistudio.google.com/apikey)):
++   ```env
++   LLM_PROVIDER=gemini
++   GEMINI_API_KEY=AIza...
++   GEMINI_CHAT_MODEL=gemini-2.0-flash
++   GEMINI_EMBEDDING_MODEL=gemini-embedding-001
++   EMBEDDING_DIM=1536
++   ```
++2. **Gemini embeddings only** (e.g. keep Groq chat, use `gemini-embedding-001`
++   for the RAG knowledge base):
++   ```env
++   LLM_PROVIDER=groq
++   GROQ_API_KEY=gsk_...
++   EMBEDDING_PROVIDER=gemini
++   GEMINI_API_KEY=AIza...
++   EMBEDDING_DIM=1536
++   ```
++
++The boot log and `/api/health` report the active engine (`gemini` or
++`groq+gemini-embed`). `gemini-embedding-001` supports Matryoshka truncation,
++so any `EMBEDDING_DIM` between 768 and 3072 works; if you change the
++dimension after data was ingested, the backend detects the drift on boot,
++wipes and re-embeds the knowledge base automatically.
++
+ ### Other providers
+ 
+ Set `LLM_PROVIDER` in `.env` to switch:
+diff --git a/backend/app/config.py b/backend/app/config.py
+index 382bf34..994176e 100755
+--- a/backend/app/config.py
++++ b/backend/app/config.py
+@@ -38,6 +38,15 @@ class Settings(BaseSettings):
+     OPENROUTER_API_KEY: str = ""
+     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
+ 
++    # --- Google Gemini (chat + embeddings, or embeddings only) ---
++    GEMINI_API_KEY: str = ""
++    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
++    GEMINI_CHAT_MODEL: str = "gemini-2.0-flash"
++    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
++    # Optional embedding override: "" = follow LLM_PROVIDER; "gemini" = use
++    # Google Gemini for embeddings no matter which provider serves chat.
++    EMBEDDING_PROVIDER: str = ""
++
+     # --- Auth ---
+     JWT_SECRET: str = "change-me-in-production"
+     JWT_EXPIRE_MINUTES: int = 60
+diff --git a/backend/app/llm/client.py b/backend/app/llm/client.py
+index b44e848..58c6dbb 100755
+--- a/backend/app/llm/client.py
++++ b/backend/app/llm/client.py
+@@ -4,8 +4,15 @@ Providers (selected via LLM_PROVIDER env):
+   - model_studio      Alibaba Cloud Model Studio (Qwen, OpenAI-compatible endpoint)
+   - openai_compatible any generic OpenAI-compatible endpoint
+   - groq              Groq (chat) + OpenRouter (embeddings) — mixed-provider mode
++  - gemini            Google Gemini (chat via generateContent, embeddings via
++                      batchEmbedContents / gemini-embedding-001)
+   - mock              deterministic offline engine used for the sandboxed demo/tests
+                       (no key required) — clearly documented in DECISIONS.md
++
++Embedding override (EMBEDDING_PROVIDER env):
++  - "" (default) embeddings come from the selected LLM provider, as before
++  - "gemini"     embeddings ALWAYS come from Google Gemini, regardless of the
++                 chat provider — e.g. Groq chat + Gemini embeddings in one app.
+ """
+ from __future__ import annotations
+ 
+@@ -88,22 +95,70 @@ def build_llm_client() -> LLMClient:
+                 "are unavailable. Falling back to the offline mock engine. "
+                 "Set OPENROUTER_API_KEY in .env to enable embeddings.")
+             provider = "mock"
++    if provider == "gemini" and not settings.GEMINI_API_KEY.strip():
++        logger.warning(
++            "LLM_PROVIDER=gemini but GEMINI_API_KEY is empty — "
++            "falling back to the offline mock engine. Set the key in .env "
++            "to use Google Gemini.")
++        provider = "mock"
+ 
++    client: LLMClient
+     if provider == "model_studio":
+         from app.llm.model_studio_adapter import ModelStudioAdapter
+ 
+-        return ModelStudioAdapter()
+-    if provider == "openai_compatible":
++        client = ModelStudioAdapter()
++    elif provider == "openai_compatible":
+         from app.llm.openai_compatible_adapter import OpenAICompatibleAdapter
+ 
+-        return OpenAICompatibleAdapter()
+-    if provider == "groq":
++        client = OpenAICompatibleAdapter()
++    elif provider == "groq":
+         from app.llm.groq_adapter import GroqAdapter
+ 
+-        return GroqAdapter()
+-    from app.llm.mock_client import MockLLMClient
++        client = GroqAdapter()
++    elif provider == "gemini":
++        from app.llm.gemini_adapter import GeminiAdapter
++
++        client = GeminiAdapter()
++    else:
++        from app.llm.mock_client import MockLLMClient
++
++        client = MockLLMClient()
++
++    # Optional embeddings override: keep the chat provider, swap in Gemini for
++    # embeddings (e.g. Groq chat + gemini-embedding-001 RAG).
++    embed_override = settings.EMBEDDING_PROVIDER.strip().lower()
++    if embed_override == "gemini" and provider != "gemini":
++        if settings.GEMINI_API_KEY.strip():
++            from app.llm.gemini_adapter import GeminiAdapter
++
++            client = _EmbeddingFacade(client, GeminiAdapter())
++        else:
++            logger.warning(
++                "EMBEDDING_PROVIDER=gemini but GEMINI_API_KEY is empty — "
++                "keeping %s embeddings. Set the key in .env to use Gemini "
++                "embeddings.", provider)
++    return client
++
++
++class _EmbeddingFacade:
++    """Chat from the configured provider, embeddings from Google Gemini.
++
++    Exposed as a distinct provider_name (e.g. "groq+gemini-embed") so the boot
++    log and /api/health make the mixed setup visible.
++    """
++
++    def __init__(self, base: LLMClient, embedder: LLMClient) -> None:
++        self._base = base
++        self._embedder = embedder
++        self.provider_name = (
++            f"{getattr(base, 'provider_name', 'unknown')}+gemini-embed")
++
++    def generate(self, messages: Iterable[dict], *, system: str | None = None,
++                 json_mode: bool = False) -> LLMResponse:
++        return self._base.generate(messages, system=system, json_mode=json_mode)
+ 
+-    return MockLLMClient()
++    def embed(self, texts: list[str]) -> list[list[float]]:
++        return self._embedder.embed(texts)
+ 
+ 
+ # Module-level singleton (rebuilt lazily so tests can swap providers).
+diff --git a/backend/app/llm/gemini_adapter.py b/backend/app/llm/gemini_adapter.py
+new file mode 100644
+index 0000000..0b1dbfb
+--- /dev/null
++++ b/backend/app/llm/gemini_adapter.py
+@@ -0,0 +1,150 @@
++"""Google Gemini adapter — chat via generateContent, embeddings via batchEmbedContents.
++
++Uses Google's REST API directly over httpx (already a project dependency), so no
++extra SDK is required and this adapter behaves exactly like the other providers.
++
++Typical .env (Gemini for BOTH chat and embeddings):
++
++    LLM_PROVIDER=gemini
++    GEMINI_API_KEY=AIza...
++    GEMINI_CHAT_MODEL=gemini-2.0-flash
++    GEMINI_EMBEDDING_MODEL=gemini-embedding-001
++    EMBEDDING_DIM=1536
++
++Typical .env (keep Groq/Model Studio for chat, Gemini ONLY for embeddings):
++
++    LLM_PROVIDER=groq
++    GROQ_API_KEY=gsk_xxx
++    EMBEDDING_PROVIDER=gemini
++    GEMINI_API_KEY=AIza...
++    EMBEDDING_DIM=1536
++
++Notes on dimensions:
++- `gemini-embedding-001` produces 3072-dim vectors by default and supports
++  Matryoshka truncation via `outputDimensionality` (sensible values: 768,
++  1536, 3072). This adapter always requests `outputDimensionality =
++  EMBEDDING_DIM` (clamped to >= 768) so the stored width always matches the
++  pgvector column / retriever expectation.
++- If you change EMBEDDING_DIM after data was ingested, the startup routine
++  (`reingest_if_dim_changed`) wipes and re-embeds the knowledge base
++  automatically — no manual volume wipe needed for the KB.
++- Chat models: any Gemini chat model id works, e.g. gemini-2.0-flash,
++  gemini-2.5-flash, gemini-2.5-pro.
++"""
++from __future__ import annotations
++
++import logging
++from typing import Any, Iterable
++
++import httpx
++
++from app.config import settings
++from app.llm.client import LLMResponse
++
++logger = logging.getLogger("publicagent.llm.gemini")
++
++# gemini-embedding-001 rejects outputDimensionality < 768.
++MIN_EMBED_DIM = 768
++
++
++def _strip_endpoint_suffix(url: str) -> str:
++    """Tolerate users pasting a full endpoint URL into GEMINI_BASE_URL."""
++    url = url.strip().rstrip("/")
++    for suffix in (":generateContent", ":batchEmbedContents", "/v1beta"):
++        if url.endswith(suffix):
++            url = url[: -len(suffix)]
++    return url
++
++
++class GeminiAdapter:
++    provider_name = "gemini"
++
++    def __init__(self,
++                 api_key: str | None = None,
++                 base_url: str | None = None,
++                 chat_model: str | None = None,
++                 embedding_model: str | None = None):
++        self.api_key = (api_key or settings.GEMINI_API_KEY).strip()
++        self.base_url = _strip_endpoint_suffix(base_url or settings.GEMINI_BASE_URL)
++        self.chat_model = chat_model or settings.GEMINI_CHAT_MODEL
++        self.embedding_model = embedding_model or settings.GEMINI_EMBEDDING_MODEL
++        if not self.api_key:
++            raise RuntimeError(
++                "GEMINI_API_KEY is empty — set it in .env or switch LLM_PROVIDER=mock."
++            )
++
++    # ------------------------------------------------------------------ chat
++    def generate(self, messages: Iterable[dict], *, system: str | None = None,
++                 json_mode: bool = False) -> LLMResponse:
++        contents: list[dict] = []
++        for m in messages:
++            role = m.get("role", "user")
++            # Gemini only understands "user" and "model" roles.
++            grole = "model" if role == "assistant" else "user"
++            text = m.get("content", "")
++            if isinstance(text, list):  # tolerate OpenAI-style content parts
++                text = " ".join(str(p) for p in text)
++            contents.append({"role": grole, "parts": [{"text": str(text)}]})
++
++        body: dict[str, Any] = {"contents": contents}
++        if system:
++            body["systemInstruction"] = {"parts": [{"text": system}]}
++        gen_cfg: dict[str, Any] = {}
++        if json_mode:
++            gen_cfg["responseMimeType"] = "application/json"
++        if gen_cfg:
++            body["generationConfig"] = gen_cfg
++
++        data = self._post(f"models/{self.chat_model}:generateContent", body)
++        try:
++            content = data["candidates"][0]["content"]["parts"][0].get("text", "")
++        except (KeyError, IndexError, TypeError):
++            content = ""
++            block = data.get("promptFeedback") or data.get("candidates") or {}
++            logger.warning("Gemini returned no content: %s", str(block)[:300])
++        usage = data.get("usageMetadata", {})
++        return LLMResponse(content=content or "", usage=usage)
++
++    # ------------------------------------------------------------- embeddings
++    def embed(self, texts: list[str]) -> list[list[float]]:
++        if not texts:
++            return []
++        dim = int(settings.EMBEDDING_DIM)
++        requests = [
++            {
++                "model": f"models/{self.embedding_model}",
++                "content": {"parts": [{"text": t}]},
++                # Keep the stored width aligned with EMBEDDING_DIM (pgvector
++                # column + brute-force cosine all assume one fixed size).
++                "outputDimensionality": max(dim, MIN_EMBED_DIM),
++            }
++            for t in texts
++        ]
++        if dim < MIN_EMBED_DIM:
++            logger.warning(
++                "EMBEDDING_DIM=%s is below gemini-embedding-001's minimum of %s — "
++                "requesting %s instead. Update EMBEDDING_DIM to avoid mismatches.",
++                dim, MIN_EMBED_DIM, MIN_EMBED_DIM)
++        data = self._post("models/"
++                          f"{self.embedding_model}:batchEmbedContents",
++                          {"requests": requests})
++        values = [
++            (item.get("values") or item.get("embedding", {}).get("values") or [])
++            for item in data.get("embeddings", [])
++        ]
++        if len(values) != len(texts):
++            raise RuntimeError(
++                f"Gemini returned {len(values)} embeddings for {len(texts)} inputs.")
++        return values
++
++    # ------------------------------------------------------------------ internals
++    def _post(self, path: str, body: dict) -> dict:
++        url = f"{self.base_url}/{path}"
++        headers = {"x-goog-api-key": self.api_key,
++                   "Content-Type": "application/json"}
++        with httpx.Client(timeout=120) as http:
++            resp = http.post(url, json=body, headers=headers)
++        if resp.status_code >= 400:
++            raise RuntimeError(
++                f"Gemini API error {resp.status_code} on {path}: {resp.text[:400]}")
++        return resp.json()
+diff --git a/backend/app/main.py b/backend/app/main.py
+index cee699b..0d8709a 100755
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -46,11 +46,17 @@ def _startup() -> None:
+         Base.metadata.create_all(bind=engine)  # idempotent
+ 
+     # Demo knowledge base + seed data on first boot.
+-    from app.rag.ingest import ingest_kb
++    from app.rag.ingest import ingest_kb, reingest_if_dim_changed
+     from app.api.auth import ensure_demo_user
+ 
+     db = SessionLocal()
+     try:
++        # If EMBEDDING_PROVIDER / EMBEDDING_DIM changed since the last run,
++        # stored KB chunks have the wrong width and RAG silently returns
++        # nothing (SQLite) or inserts fail (pgvector). Heal before anything
++        # else touches the KB.
++        if reingest_if_dim_changed(db):
++            logger.info("Knowledge base re-ingested after embedding-dimension change")
+         if not inspect(engine).has_table("kb_chunks") or db.execute(
+             __import__("sqlalchemy").text("SELECT COUNT(*) FROM kb_chunks")
+         ).scalar() == 0:
+@@ -64,11 +70,16 @@ def _startup() -> None:
+     import os
+ 
+     if os.environ.get("SEED_ON_START", "0") not in ("0", "false", "False"):
+-        from app.scripts.seed_demo_data import seed_if_empty
+-
+-        seeded = seed_if_empty()
+-        if seeded:
+-            logger.info("Demo data seeded")
++        try:
++            from app.scripts.seed_demo_data import seed_if_empty
++
++            seeded = seed_if_empty()
++            if seeded:
++                logger.info("Demo data seeded")
++        except Exception:
++            # A seeding problem must never prevent the API from booting.
++            logger.exception("Demo data seeding failed — continuing without "
++                             "seeded demo complaints/conversations")
+ 
+     # Follow-up scheduler (in-process; job state persisted in DB).
+     from app.scheduler.followup_jobs import start_scheduler
+diff --git a/backend/app/rag/ingest.py b/backend/app/rag/ingest.py
+index 033f3e6..d389688 100755
+--- a/backend/app/rag/ingest.py
++++ b/backend/app/rag/ingest.py
+@@ -6,15 +6,19 @@ source_ref replaces its chunks, so the operation is idempotent.
+ """
+ from __future__ import annotations
+ 
++import logging
+ import re
+ 
+-from sqlalchemy import select
++from sqlalchemy import delete, select
+ from sqlalchemy.orm import Session
+ 
+ from app.config import settings
++from app.db import is_postgres
+ from app.llm.client import get_llm_client
+ from app.models import KBChunk, KBDocument
+ 
++logger = logging.getLogger("publicagent.rag.ingest")
++
+ # 5–10 short illustrative docs (spec §10). Clearly marked as demo guidance,
+ # not verified legal or official text.
+ KB_DOCS: list[dict] = [
+@@ -239,3 +243,51 @@ def ingest_kb(db: Session) -> dict:
+         doc_count += 1
+     db.commit()
+     return {"documents": doc_count, "chunks": chunk_count}
++
++
++def reingest_if_dim_changed(db: Session) -> bool:
++    """Self-heal embedding-dimension drift (fixes the classic 'silent empty RAG').
++
++    Whenever EMBEDDING_PROVIDER / EMBEDDING_MODEL_NAME / EMBEDDING_DIM changes,
++    previously ingested chunks have the OLD dimension while the retriever
++    queries with the NEW one. Symptoms: on SQLite every chunk is silently
++    skipped (length mismatch → retrieve() returns []), on PostgreSQL/pgvector
++    inserts fail with 'vector dimension mismatch'. Both are painful to debug.
++
++    Strategy: compare one stored embedding's length with settings.EMBEDDING_DIM;
++    if they differ, wipe kb_documents/kb_chunks (PostgreSQL: recreate the
++    fixed-width vector column) and re-ingest with the current provider.
++    """
++    from sqlalchemy import text as sql_text
++
++    row = db.execute(select(KBChunk).limit(1)).scalars().first()
++    if row is None or row.embedding is None:
++        return False  # nothing ingested yet (or no embeddings) — nothing to heal
++
++    try:
++        stored_len = len(list(row.embedding))
++    except TypeError:  # unusual embedding type — leave it alone
++        return False
++    if stored_len == settings.EMBEDDING_DIM:
++        return False
++
++    logger.warning(
++        "Embedding dimension drift detected: stored chunks have dim=%s but "
++        "EMBEDDING_DIM=%s — wiping and re-ingesting the knowledge base.",
++        stored_len, settings.EMBEDDING_DIM)
++    db.execute(delete(KBChunk))
++    db.execute(delete(KBDocument))
++    if is_postgres():
++        try:
++            db.execute(sql_text("ALTER TABLE kb_chunks DROP COLUMN embedding"))
++            db.execute(sql_text(
++                f"ALTER TABLE kb_chunks ADD COLUMN embedding "
++                f"vector({settings.EMBEDDING_DIM})"))
++        except Exception:
++            db.rollback()
++            logger.exception("Could not resize pgvector column — RAG will keep "
++                             "the old dimension until the volume is wiped.")
++            return False
++    db.commit()
++    ingest_kb(db)
++    return True
+diff --git a/backend/app/scripts/seed_demo_data.py b/backend/app/scripts/seed_demo_data.py
+index e69de29..4c1a5dc 100644
+--- a/backend/app/scripts/seed_demo_data.py
++++ b/backend/app/scripts/seed_demo_data.py
+@@ -0,0 +1,329 @@
++"""Seed idempotent demo data for PublicAgent AI.
++
++This module was previously EMPTY, which crashed backend startup with
++`ImportError: cannot import name 'seed_if_empty'` (main.py imports it when
++SEED_ON_START is enabled) — the seed now restores the documented behaviour:
++
++    python -m app.scripts.seed_demo_data     # manual run
++    SEED_ON_START=1 (default in .env.example) → auto-run at boot
++
++What gets seeded (only if the demo citizen has NO complaints/conversations yet):
++  - the demo citizen user (citizen@demo.pk / demo1234 — same as demo-login)
++  - the knowledge base (app.rag.ingest.ingest_kb — markdown docs + embeddings)
++  - 3 demo complaints across the mock-government lifecycle
++    (received / under_review / resolved), registered in the mock gov case
++    store via MockGovernmentClient.seed_case so status tracking works
++  - matching complaint events, in-app notifications and one pending follow-up
++    job so the scheduler has something to process
++  - 2 demo conversations with realistic transcripts
++
++Everything is clearly demo/mock data. Re-running never duplicates anything.
++"""
++from __future__ import annotations
++
++import logging
++from datetime import datetime, timedelta, timezone
++
++from sqlalchemy import func, select
++from sqlalchemy.orm import Session
++
++logger = logging.getLogger("publicagent.seed")
++
++# Reference numbers must match the pattern the parser recognises:
++# [A-Z]{2,5}-<year>-<4..8 digits>  (see app.gov + message parser).
++_REFS = ("CMP-2026-001928", "CMP-2026-001931", "CMP-2026-001934")
++
++
++def seed_if_empty(db: Session | None = None) -> bool:
++    """Seed demo data once. Returns True when something was created."""
++    owned = False
++    if db is None:
++        from app.db import SessionLocal
++
++        db = SessionLocal()
++        owned = True
++    try:
++        # Standalone runs (CLI) still need tables; harmless when they exist.
++        from app.db import Base, engine
++
++        import app.models  # noqa: F401
++
++        Base.metadata.create_all(bind=engine)
++
++        from app.api.auth import ensure_demo_user
++        from app.models import (Complaint, Conversation, FollowupJob, Message,
++                                Notification)
++        from app.rag.ingest import ingest_kb
++
++        user = ensure_demo_user(db)
++
++        has_complaints = db.execute(
++            select(func.count()).select_from(Complaint)
++            .where(Complaint.user_id == user.id)
++        ).scalar() or 0
++        has_conversations = db.execute(
++            select(func.count()).select_from(Conversation)
++            .where(Conversation.user_id == user.id)
++        ).scalar() or 0
++        if has_complaints or has_conversations:
++            return False  # already seeded — stay idempotent
++
++        # 1) Knowledge base (idempotent: keyed by source_ref)
++        kb_stats = ingest_kb(db)
++
++        now = datetime.now(timezone.utc)
++        complaints: list[Complaint] = []
++
++        # 2) Complaint #1 — police misconduct, under review (active case)
++        c1 = Complaint(
++            reference_number=_REFS[0], user_id=user.id,
++            category="police_misconduct",
++            department="Provincial Police Complaints Authority (Demo Data)",
++            jurisdiction="Punjab (Demo)",
++            status="under_review",
++            description=(
++                "On 12 June 2026 at Bagh-e-Jinnah, Lahore, a traffic warden "
++                "demanded an on-the-spot payment after stopping me for a "
++                "routine document check. I refused and was threatened with "
++                "detention. I can identify the officer by his belt number."),
++            structured_fields={
++                "incident_date": "2026-06-12",
++                "incident_time": "17:30",
++                "location": "Bagh-e-Jinnah, Lahore",
++                "police_station": "Model Town Police Station",
++                "officer_badge_number": "__SKIPPED__",
++                "description": "Officer demanded on-the-spot payment and threatened detention.",
++            },
++            unverified_fields=["officer_badge_number", "police_station"],
++            submitted_at=now - timedelta(hours=26),
++        )
++        # 3) Complaint #2 — utility service, resolved (finished lifecycle)
++        c2 = Complaint(
++            reference_number=_REFS[1], user_id=user.id,
++            category="utility_service",
++            department="Electric Supply Company Consumer Complaints Cell (Demo Data)",
++            jurisdiction="Regional (Demo)",
++            status="resolved",
++            description=(
++                "Persistent power outages of 6-8 hours daily in my area for "
++                "two weeks while the monthly bill shows estimated readings "
++                "instead of actual meter readings. Consumer account 4455-8812."),
++            structured_fields={
++                "account_number": "4455-8812",
++                "location": "Gulberg III, Lahore",
++                "incident_date": "2026-06-02",
++                "description": "Prolonged load-shedding plus estimated billing despite a working meter.",
++            },
++            unverified_fields=[],
++            submitted_at=now - timedelta(days=9),
++            last_checked_at=now - timedelta(minutes=10),
++            next_check_at=now + timedelta(minutes=10),
++        )
++        # 4) Complaint #3 — police misconduct, just received (fresh case)
++        c3 = Complaint(
++            reference_number=_REFS[2], user_id=user.id,
++            category="police_misconduct",
++            department="Citizen Police Liaison Cell (Demo Data)",
++            jurisdiction="Karachi Division (Demo)",
++            status="received",
++            description=(
++                "The desk officer at my local police station refused to "
++                "register my FIR about a stolen motorcycle and told me to "
++                "\"settle it outside\". This happened yesterday evening."),
++            structured_fields={
++                "incident_date": (now - timedelta(days=1)).date().isoformat(),
++                "incident_time": "20:15",
++                "location": "Saddar, Karachi",
++                "police_station": "Saddar Police Station",
++                "description": "FIR refused for a stolen motorcycle; advised to settle privately.",
++            },
++            unverified_fields=["police_station"],
++            submitted_at=now - timedelta(minutes=45),
++        )
++        complaints = [c1, c2, c3]
++        for c in complaints:
++            db.add(c)
++        db.flush()
++
++        # 5) Complaint events (mirrors the lifecycle the agent produces)
++        from app.models import ComplaintEvent
++
++        def _event(complaint: Complaint, etype: str, old: str | None,
++                   new: str | None, meta: dict, at: datetime) -> ComplaintEvent:
++            return ComplaintEvent(complaint_id=complaint.id, event_type=etype,
++                                  old_status=old, new_status=new, metadata_=meta,
++                                  created_at=at)
++
++        db.add(_event(c1, "SUBMITTED", None, "submitted",
++                      {"note": "Complaint submitted after explicit citizen confirmation"},
++                      c1.submitted_at))
++        db.add(_event(c1, "STATUS_UPDATED", "submitted", "received",
++                      {"source": "mock"}, c1.submitted_at + timedelta(minutes=1)))
++        db.add(_event(c1, "STATUS_UPDATED", "received", "under_review",
++                      {"source": "mock"}, c1.submitted_at + timedelta(minutes=3)))
++
++        db.add(_event(c2, "SUBMITTED", None, "submitted",
++                      {"note": "Complaint submitted after explicit citizen confirmation"},
++                      c2.submitted_at))
++        db.add(_event(c2, "STATUS_UPDATED", "submitted", "resolved",
++                      {"source": "mock",
++                       "note": "Utility replaced the faulty transformer; billing corrected"},
++                      c2.submitted_at + timedelta(days=2)))
++
++        db.add(_event(c3, "SUBMITTED", None, "submitted",
++                      {"note": "Complaint submitted after explicit citizen confirmation"},
++                      c3.submitted_at))
++        db.add(_event(c3, "STATUS_UPDATED", "submitted", "received",
++                      {"source": "mock"}, c3.submitted_at + timedelta(minutes=1)))
++
++        # 6) Notifications (in-app inbox)
++        db.add_all([
++            Notification(
++                user_id=user.id, complaint_id=c1.id,
++                title="Your complaint is under review",
++                body=f"Complaint {c1.reference_number} has been assigned to an "
++                     "inquiry officer at the Provincial Police Complaints Authority "
++                     "(demo data). You will be notified when the status changes.",
++                read=False, created_at=now - timedelta(hours=25)),
++            Notification(
++                user_id=user.id, complaint_id=c2.id,
++                title="Complaint resolved",
++                body=f"Complaint {c2.reference_number} was marked resolved by the "
++                     "utility's complaints cell (demo data). The transformer was "
++                     "replaced and your billing was corrected. You may close or "
++                     "appeal it from the complaint page.",
++                read=True, created_at=now - timedelta(days=7)),
++            Notification(
++                user_id=user.id, complaint_id=c3.id,
++                title="Complaint received",
++                body=f"Complaint {c3.reference_number} was acknowledged by the "
++                     "Citizen Police Liaison Cell (demo data). Keep your "
++                     "reference number for all follow-ups.",
++                read=False, created_at=now - timedelta(minutes=44)),
++        ])
++
++        # 7) One pending follow-up job so the scheduler has work on boot
++        db.add(FollowupJob(
++            complaint_id=c3.id, scheduled_for=now + timedelta(minutes=2),
++            status="pending"))
++
++        # 8) Demo conversations with realistic transcripts
++        conv1 = Conversation(
++            user_id=user.id, complaint_id=c1.id,
++            title="Traffic warden demanded on-the-spot payment…",
++            agent_state={"phase": "tracking", "issue_type": "police_misconduct",
++                         "initial_request": (c1.description or "")[:800]},
++            created_at=now - timedelta(hours=27),
++        )
++        db.add(conv1)
++        db.flush()
++        db.add_all([
++            Message(conversation_id=conv1.id, role="user",
++                    content="A traffic warden stopped me near Bagh-e-Jinnah and demanded "
++                            "money on the spot. When I refused he threatened to detain me. "
++                            "This is not right, what can I do?",
++                    created_at=now - timedelta(hours=27)),
++            Message(conversation_id=conv1.id, role="assistant",
++                    content="I'm sorry that happened — being pressured for money during a "
++                            "routine check is a serious matter. I'm not deciding anything, "
++                            "but based on the (demo) guidance I retrieved, this sounds like "
++                            "it may be police misconduct, typically handled by a complaints "
++                            "authority. You can file a formal complaint with a reference "
++                            "number you can track, or simply report the incident on record.",
++                    structured_payload={"type": "options",
++                                        "options": ["file", "report", "understand", "not_sure"]},
++                    created_at=now - timedelta(hours=26, minutes=58)),
++            Message(conversation_id=conv1.id, role="user", content="File a Formal Complaint",
++                    created_at=now - timedelta(hours=26, minutes=57)),
++            Message(conversation_id=conv1.id, role="assistant",
++                    content="Your complaint has been submitted with reference CMP-2026-001928 "
++                            "(demo data). I'll keep watching its status and will notify you "
++                            "here the moment anything changes.",
++                    structured_payload={"type": "complaint_submitted",
++                                        "reference_number": _REFS[0]},
++                    created_at=now - timedelta(hours=26)),
++        ])
++
++        conv2 = Conversation(
++            user_id=user.id, complaint_id=None,
++            title="Electricity outages and estimated billing",
++            agent_state={"phase": "options_presented",
++                         "issue_type": "utility_service",
++                         "initial_request": (c2.description or "")[:800]},
++            created_at=now - timedelta(days=10),
++        )
++        db.add(conv2)
++        db.flush()
++        db.add_all([
++            Message(conversation_id=conv2.id, role="user",
++                    content="We have 6 to 8 hours of load shedding every day and my bill "
++                            "shows estimated readings even though my meter works fine. "
++                            "Who do I even complain to about this?",
++                    created_at=now - timedelta(days=10)),
++            Message(conversation_id=conv2.id, role="assistant",
++                    content="That combination — prolonged outages plus estimated billing "
++                            "despite a working meter — is a known category of utility "
++                            "service complaints (demo guidance). It is normally handled "
++                            "first by the utility's own consumer complaints cell, and "
++                            "having your consumer/account number ready speeds things up. "
++                            "Would you like to file a formal complaint or just report it?",
++                    structured_payload={"type": "options",
++                                        "options": ["file", "report", "understand", "not_sure"]},
++                    created_at=now - timedelta(days=9, minutes=23, hours=23)),
++        ])
++
++        # 9) Register the three cases in the mock government case store so
++        #    status polling / tracking works for seeded complaints too.
++        _register_mock_cases(complaints)
++
++        db.commit()
++        logger.info(
++            "Demo data seeded: %s complaints, 2 conversations, KB %s",
++            len(complaints), kb_stats)
++        return True
++    finally:
++        if owned:
++            db.close()
++
++
++def _register_mock_cases(complaints) -> None:
++    """Pre-register seeded complaints in the mock gov case store."""
++    from datetime import datetime as _dt
++
++    from app.gov.mock_client import MockGovernmentClient
++
++    gov = MockGovernmentClient()
++    for c in complaints:
++        try:
++            submitted = c.submitted_at
++            if isinstance(submitted, _dt) and submitted.tzinfo is None:
++                submitted = submitted.replace(tzinfo=timezone.utc)
++            gov.seed_case(
++                c.reference_number,
++                submitted_at=submitted or _dt.now(timezone.utc),
++                category=c.category,
++                department=c.department,
++                jurisdiction=c.jurisdiction,
++                description=c.description,
++                structured_fields=c.structured_fields or {},
++                status_override=c.status,
++                idempotency_key=f"seed-{c.reference_number}",
++            )
++        except Exception:  # pragma: no cover - store write issues must not abort seeding
++            logger.exception("Could not pre-register %s in the mock gov store",
++                             c.reference_number)
++
++
++def main() -> None:
++    import sys
++
++    logging.basicConfig(level=logging.INFO,
++                        format="%(asctime)s %(levelname)s %(name)s: %(message)s")
++    created = seed_if_empty()
++    print("Demo data seeded (fresh)." if created
++          else "Demo data already present — nothing to do (idempotent).")
++    sys.exit(0 if created else 0)
++
++
++if __name__ == "__main__":
++    main()
+diff --git a/backend/tests/test_gemini_provider.py b/backend/tests/test_gemini_provider.py
+new file mode 100644
+index 0000000..71a8bf0
+--- /dev/null
++++ b/backend/tests/test_gemini_provider.py
+@@ -0,0 +1,96 @@
++"""Tests for the Google Gemini provider wiring (no network calls)."""
++from __future__ import annotations
++
++import pytest
++
++
++@pytest.fixture()
++def reset_clients():
++    """Reset the llm-client singleton and settings after each test."""
++    yield
++    from app.config import settings
++    from app.llm.client import set_llm_client
++
++    set_llm_client(None)
++    settings.LLM_PROVIDER = "mock"
++    settings.EMBEDDING_PROVIDER = ""
++    settings.GEMINI_API_KEY = ""
++    settings.OPENROUTER_API_KEY = ""
++    settings.GROQ_API_KEY = ""
++
++
++def test_gemini_provider_without_key_falls_back_to_mock(reset_clients):
++    from app.config import settings
++    from app.llm.client import build_llm_client, set_llm_client
++    from app.llm.mock_client import MockLLMClient
++
++    set_llm_client(None)
++    settings.LLM_PROVIDER = "gemini"
++    settings.GEMINI_API_KEY = ""
++    client = build_llm_client()
++    assert isinstance(client, MockLLMClient)
++
++
++def test_gemini_embed_facade_wiring(reset_clients, monkeypatch):
++    """EMBEDDING_PROVIDER=gemini keeps the chat provider but swaps embed().
++
++    The Gemini adapter's embed() is monkeypatched so no network call happens.
++    """
++    from app.config import settings
++    from app.llm.client import build_llm_client, set_llm_client
++
++    set_llm_client(None)
++    settings.LLM_PROVIDER = "mock"
++    settings.EMBEDDING_PROVIDER = "gemini"
++    settings.GEMINI_API_KEY = "AIza-test"
++    settings.EMBEDDING_DIM = 8
++
++    import app.llm.gemini_adapter as ga
++
++    def fake_embed(self, texts):
++        return [[0.1] * settings.EMBEDDING_DIM for _ in texts]
++
++    monkeypatch.setattr(ga.GeminiAdapter, "embed", fake_embed)
++
++    client = build_llm_client()
++    assert client.provider_name == "mock+gemini-embed"
++    # Chat still served by the base provider (mock).
++    resp = client.generate([{"role": "user", "content": "hello"}])
++    assert resp.content
++    # Embeddings delegated to the (stubbed) Gemini adapter.
++    vecs = client.embed(["query one", "query two"])
++    assert len(vecs) == 2 and len(vecs[0]) == 8
++
++
++def test_gemini_adapter_generates_expected_payload(monkeypatch):
++    """The REST payload shape: systemInstruction, roles, outputDimensionality."""
++    from app.llm.gemini_adapter import GeminiAdapter
++
++    adapter = GeminiAdapter(api_key="AIza-test")
++
++    captured: dict = {}
++
++    def fake_post(path, body):
++        captured["path"] = path
++        captured["body"] = body
++        return {"candidates": [{"content": {"parts": [{"text": "Hi!"}]}}],
++                "usageMetadata": {"totalTokenCount": 3}}
++
++    monkeypatch.setattr(adapter, "_post", fake_post)
++    resp = adapter.generate(
++        [{"role": "assistant", "content": "previous"}, {"role": "user", "content": "hello"}],
++        system="You are PublicAgent.",
++    )
++    assert resp.content == "Hi!"
++    assert captured["path"].endswith(":generateContent")
++    assert captured["body"]["systemInstruction"]["parts"][0]["text"] == "You are PublicAgent."
++    assert captured["body"]["contents"][0]["role"] == "model"
++    assert captured["body"]["contents"][1]["role"] == "user"
++
++    # Embeddings request includes outputDimensionality matching EMBEDDING_DIM.
++    import app.config as config_mod
++
++    monkeypatch.setattr(config_mod.settings, "EMBEDDING_DIM", 1536)
++    monkeypatch.setattr(adapter, "_post", lambda p, b: {"embeddings": [{"values": [0.0] * 1536}]})
++    vec = adapter.embed(["one text"])
++    assert len(vec[0]) == 1536
+diff --git a/backend/tests/test_seed_demo_data.py b/backend/tests/test_seed_demo_data.py
+new file mode 100644
+index 0000000..10ee576
+--- /dev/null
++++ b/backend/tests/test_seed_demo_data.py
+@@ -0,0 +1,63 @@
++"""Tests for app.scripts.seed_demo_data — the previously-empty seed module."""
++from __future__ import annotations
++
++from sqlalchemy import func, select
++
++from app.models import (Complaint, ComplaintEvent, Conversation, FollowupJob,
++                        KBChunk, Message, Notification)
++
++
++def test_seed_creates_demo_dataset(db, user):
++    from app.scripts.seed_demo_data import seed_if_empty
++
++    assert seed_if_empty(db) is True
++
++    n_complaints = db.execute(
++        select(func.count()).select_from(Complaint)
++        .where(Complaint.user_id == user.id)).scalar()
++    assert n_complaints == 3
++
++    statuses = {c.status for c in db.execute(select(Complaint)).scalars()}
++    assert {"received", "under_review", "resolved"} <= statuses
++
++    refs = {c.reference_number for c in db.execute(select(Complaint)).scalars()}
++    assert all(r.startswith("CMP-2026-") for r in refs)
++
++    n_msgs = db.execute(select(func.count()).select_from(Message)).scalar()
++    assert n_msgs >= 6
++    n_conv = db.execute(select(func.count()).select_from(Conversation)).scalar()
++    assert n_conv == 2
++    n_events = db.execute(select(func.count()).select_from(ComplaintEvent)).scalar()
++    assert n_events >= 5
++    n_notifs = db.execute(select(func.count()).select_from(Notification)).scalar()
++    assert n_notifs >= 3
++    n_jobs = db.execute(select(func.count()).select_from(FollowupJob)).scalar()
++    assert n_jobs >= 1
++
++    # Knowledge base ingested with embeddings (mock provider, EMBEDDING_DIM wide)
++    n_chunks = db.execute(select(func.count()).select_from(KBChunk)).scalar()
++    assert n_chunks > 0
++
++
++def test_seed_is_idempotent(db, user):
++    from app.scripts.seed_demo_data import seed_if_empty
++
++    assert seed_if_empty(db) is True
++    assert seed_if_empty(db) is False  # second run: nothing duplicated
++
++    n_complaints = db.execute(select(func.count()).select_from(Complaint)).scalar()
++    assert n_complaints == 3
++    n_conv = db.execute(select(func.count()).select_from(Conversation)).scalar()
++    assert n_conv == 2
++
++
++def test_seeded_cases_registered_in_mock_gov_store(db, user):
++    from app.gov.mock_client import MockGovernmentClient
++    from app.scripts.seed_demo_data import seed_if_empty
++
++    seed_if_empty(db)
++    gov = MockGovernmentClient()
++    for c in db.execute(select(Complaint)).scalars():
++        status = gov.get_complaint_status(c.reference_number)
++        assert status.get("source") == "mock"
++        assert status.get("status") == c.status

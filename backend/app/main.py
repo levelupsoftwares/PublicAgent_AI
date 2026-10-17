@@ -46,11 +46,17 @@ def _startup() -> None:
         Base.metadata.create_all(bind=engine)  # idempotent
 
     # Demo knowledge base + seed data on first boot.
-    from app.rag.ingest import ingest_kb
+    from app.rag.ingest import ingest_kb, reingest_if_dim_changed
     from app.api.auth import ensure_demo_user
 
     db = SessionLocal()
     try:
+        # If EMBEDDING_PROVIDER / EMBEDDING_DIM changed since the last run,
+        # stored KB chunks have the wrong width and RAG silently returns
+        # nothing (SQLite) or inserts fail (pgvector). Heal before anything
+        # else touches the KB.
+        if reingest_if_dim_changed(db):
+            logger.info("Knowledge base re-ingested after embedding-dimension change")
         if not inspect(engine).has_table("kb_chunks") or db.execute(
             __import__("sqlalchemy").text("SELECT COUNT(*) FROM kb_chunks")
         ).scalar() == 0:
@@ -64,11 +70,16 @@ def _startup() -> None:
     import os
 
     if os.environ.get("SEED_ON_START", "0") not in ("0", "false", "False"):
-        from app.scripts.seed_demo_data import seed_if_empty
+        try:
+            from app.scripts.seed_demo_data import seed_if_empty
 
-        seeded = seed_if_empty()
-        if seeded:
-            logger.info("Demo data seeded")
+            seeded = seed_if_empty()
+            if seeded:
+                logger.info("Demo data seeded")
+        except Exception:
+            # A seeding problem must never prevent the API from booting.
+            logger.exception("Demo data seeding failed — continuing without "
+                             "seeded demo complaints/conversations")
 
     # Follow-up scheduler (in-process; job state persisted in DB).
     from app.scheduler.followup_jobs import start_scheduler

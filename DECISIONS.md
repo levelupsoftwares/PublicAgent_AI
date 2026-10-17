@@ -142,3 +142,25 @@ decided and why*.
   Urdu/localisation, admin portal — all out of MVP scope per spec §A exclusions.
 - Browser E2E tests skipped per spec §19; the API-level integration test covers
   the full journey instead.
+
+## Post-review fixes (MVP patch 2)
+
+25. **Google Gemini provider** (`app/llm/gemini_adapter.py`): REST over httpx (no
+    new SDK dependency). Two modes via `.env` only — `LLM_PROVIDER=gemini`
+    (chat + embeddings from one key) or `EMBEDDING_PROVIDER=gemini` (Gemini
+    embeddings with any other chat provider; surfaces as e.g.
+    `groq+gemini-embed` in the boot log and `/api/health`). Embeddings always
+    request `outputDimensionality = EMBEDDING_DIM` (clamped to ≥768) so stored
+    widths stay aligned with the pgvector column / brute-force cosine.
+26. **`seed_demo_data.py` was empty** — `main.py` imports `seed_if_empty()` at
+    boot, so the app crashed with ImportError on start. The module now seeds
+    (idempotently): the demo citizen, the KB, 3 complaints across the mock
+    lifecycle (registered in the mock gov case store so tracking works),
+    complaint events, notifications, one pending follow-up job and 2 demo
+    conversations. `SEED_ON_START` failures no longer block boot (logged and
+    skipped instead).
+27. **Embedding-dimension drift self-heal** (`reingest_if_dim_changed`): when
+    the embedding provider/model/dimension changes, old KB chunks have the
+    wrong width — SQLite silently returns empty RAG results, pgvector raises
+    dimension-mismatch errors. Startup now detects the drift, wipes and
+    re-embeds the KB automatically (PostgreSQL column is recreated).

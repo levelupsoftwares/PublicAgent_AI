@@ -52,6 +52,35 @@ Out of the box the `.env` is wired for `LLM_PROVIDER=groq`:
 > volume (`docker compose down -v`) so the `kb_chunks.embedding` column is
 > recreated at the new width on first boot.
 
+### Google Gemini (chat + embeddings)
+
+Gemini is supported in two modes — both configured purely via `.env`:
+
+1. **Gemini for everything** — dynamic chat replies AND embeddings from one
+   key ([get a key](https://aistudio.google.com/apikey)):
+   ```env
+   LLM_PROVIDER=gemini
+   GEMINI_API_KEY=AIza...
+   GEMINI_CHAT_MODEL=gemini-2.0-flash
+   GEMINI_EMBEDDING_MODEL=gemini-embedding-001
+   EMBEDDING_DIM=1536
+   ```
+2. **Gemini embeddings only** (e.g. keep Groq chat, use `gemini-embedding-001`
+   for the RAG knowledge base):
+   ```env
+   LLM_PROVIDER=groq
+   GROQ_API_KEY=gsk_...
+   EMBEDDING_PROVIDER=gemini
+   GEMINI_API_KEY=AIza...
+   EMBEDDING_DIM=1536
+   ```
+
+The boot log and `/api/health` report the active engine (`gemini` or
+`groq+gemini-embed`). `gemini-embedding-001` supports Matryoshka truncation,
+so any `EMBEDDING_DIM` between 768 and 3072 works; if you change the
+dimension after data was ingested, the backend detects the drift on boot,
+wipes and re-embeds the knowledge base automatically.
+
 ### Other providers
 
 Set `LLM_PROVIDER` in `.env` to switch:

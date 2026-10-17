@@ -4,8 +4,15 @@ Providers (selected via LLM_PROVIDER env):
   - model_studio      Alibaba Cloud Model Studio (Qwen, OpenAI-compatible endpoint)
   - openai_compatible any generic OpenAI-compatible endpoint
   - groq              Groq (chat) + OpenRouter (embeddings) — mixed-provider mode
+  - gemini            Google Gemini (chat via generateContent, embeddings via
+                      batchEmbedContents / gemini-embedding-001)
   - mock              deterministic offline engine used for the sandboxed demo/tests
                       (no key required) — clearly documented in DECISIONS.md
+
+Embedding override (EMBEDDING_PROVIDER env):
+  - "" (default) embeddings come from the selected LLM provider, as before
+  - "gemini"     embeddings ALWAYS come from Google Gemini, regardless of the
+                 chat provider — e.g. Groq chat + Gemini embeddings in one app.
 """
 from __future__ import annotations
 
@@ -88,22 +95,70 @@ def build_llm_client() -> LLMClient:
                 "are unavailable. Falling back to the offline mock engine. "
                 "Set OPENROUTER_API_KEY in .env to enable embeddings.")
             provider = "mock"
+    if provider == "gemini" and not settings.GEMINI_API_KEY.strip():
+        logger.warning(
+            "LLM_PROVIDER=gemini but GEMINI_API_KEY is empty — "
+            "falling back to the offline mock engine. Set the key in .env "
+            "to use Google Gemini.")
+        provider = "mock"
 
+    client: LLMClient
     if provider == "model_studio":
         from app.llm.model_studio_adapter import ModelStudioAdapter
 
-        return ModelStudioAdapter()
-    if provider == "openai_compatible":
+        client = ModelStudioAdapter()
+    elif provider == "openai_compatible":
         from app.llm.openai_compatible_adapter import OpenAICompatibleAdapter
 
-        return OpenAICompatibleAdapter()
-    if provider == "groq":
+        client = OpenAICompatibleAdapter()
+    elif provider == "groq":
         from app.llm.groq_adapter import GroqAdapter
 
-        return GroqAdapter()
-    from app.llm.mock_client import MockLLMClient
+        client = GroqAdapter()
+    elif provider == "gemini":
+        from app.llm.gemini_adapter import GeminiAdapter
 
-    return MockLLMClient()
+        client = GeminiAdapter()
+    else:
+        from app.llm.mock_client import MockLLMClient
+
+        client = MockLLMClient()
+
+    # Optional embeddings override: keep the chat provider, swap in Gemini for
+    # embeddings (e.g. Groq chat + gemini-embedding-001 RAG).
+    embed_override = settings.EMBEDDING_PROVIDER.strip().lower()
+    if embed_override == "gemini" and provider != "gemini":
+        if settings.GEMINI_API_KEY.strip():
+            from app.llm.gemini_adapter import GeminiAdapter
+
+            client = _EmbeddingFacade(client, GeminiAdapter())
+        else:
+            logger.warning(
+                "EMBEDDING_PROVIDER=gemini but GEMINI_API_KEY is empty — "
+                "keeping %s embeddings. Set the key in .env to use Gemini "
+                "embeddings.", provider)
+    return client
+
+
+class _EmbeddingFacade:
+    """Chat from the configured provider, embeddings from Google Gemini.
+
+    Exposed as a distinct provider_name (e.g. "groq+gemini-embed") so the boot
+    log and /api/health make the mixed setup visible.
+    """
+
+    def __init__(self, base: LLMClient, embedder: LLMClient) -> None:
+        self._base = base
+        self._embedder = embedder
+        self.provider_name = (
+            f"{getattr(base, 'provider_name', 'unknown')}+gemini-embed")
+
+    def generate(self, messages: Iterable[dict], *, system: str | None = None,
+                 json_mode: bool = False) -> LLMResponse:
+        return self._base.generate(messages, system=system, json_mode=json_mode)
+
+    def embed(self, texts: list[str]) -> list[list[float]]:
+        return self._embedder.embed(texts)
 
 
 # Module-level singleton (rebuilt lazily so tests can swap providers).

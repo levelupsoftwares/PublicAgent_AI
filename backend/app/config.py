@@ -38,6 +38,15 @@ class Settings(BaseSettings):
     OPENROUTER_API_KEY: str = ""
     OPENROUTER_BASE_URL: str = "https://openrouter.ai/api/v1"
 
+    # --- Google Gemini (chat + embeddings, or embeddings only) ---
+    GEMINI_API_KEY: str = ""
+    GEMINI_BASE_URL: str = "https://generativelanguage.googleapis.com/v1beta"
+    GEMINI_CHAT_MODEL: str = "gemini-2.0-flash"
+    GEMINI_EMBEDDING_MODEL: str = "gemini-embedding-001"
+    # Optional embedding override: "" = follow LLM_PROVIDER; "gemini" = use
+    # Google Gemini for embeddings no matter which provider serves chat.
+    EMBEDDING_PROVIDER: str = ""
+
     # --- Auth ---
     JWT_SECRET: str = "change-me-in-production"
     JWT_EXPIRE_MINUTES: int = 60

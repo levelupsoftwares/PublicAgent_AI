@@ -6,14 +6,18 @@ source_ref replaces its chunks, so the operation is idempotent.
 """
 from __future__ import annotations
 
+import logging
 import re
 
-from sqlalchemy import select
+from sqlalchemy import delete, select
 from sqlalchemy.orm import Session
 
 from app.config import settings
+from app.db import is_postgres
 from app.llm.client import get_llm_client
 from app.models import KBChunk, KBDocument
+
+logger = logging.getLogger("publicagent.rag.ingest")
 
 # 5–10 short illustrative docs (spec §10). Clearly marked as demo guidance,
 # not verified legal or official text.
@@ -239,3 +243,51 @@ def ingest_kb(db: Session) -> dict:
         doc_count += 1
     db.commit()
     return {"documents": doc_count, "chunks": chunk_count}
+
+
+def reingest_if_dim_changed(db: Session) -> bool:
+    """Self-heal embedding-dimension drift (fixes the classic 'silent empty RAG').
+
+    Whenever EMBEDDING_PROVIDER / EMBEDDING_MODEL_NAME / EMBEDDING_DIM changes,
+    previously ingested chunks have the OLD dimension while the retriever
+    queries with the NEW one. Symptoms: on SQLite every chunk is silently
+    skipped (length mismatch → retrieve() returns []), on PostgreSQL/pgvector
+    inserts fail with 'vector dimension mismatch'. Both are painful to debug.
+
+    Strategy: compare one stored embedding's length with settings.EMBEDDING_DIM;
+    if they differ, wipe kb_documents/kb_chunks (PostgreSQL: recreate the
+    fixed-width vector column) and re-ingest with the current provider.
+    """
+    from sqlalchemy import text as sql_text
+
+    row = db.execute(select(KBChunk).limit(1)).scalars().first()
+    if row is None or row.embedding is None:
+        return False  # nothing ingested yet (or no embeddings) — nothing to heal
+
+    try:
+        stored_len = len(list(row.embedding))
+    except TypeError:  # unusual embedding type — leave it alone
+        return False
+    if stored_len == settings.EMBEDDING_DIM:
+        return False
+
+    logger.warning(
+        "Embedding dimension drift detected: stored chunks have dim=%s but "
+        "EMBEDDING_DIM=%s — wiping and re-ingesting the knowledge base.",
+        stored_len, settings.EMBEDDING_DIM)
+    db.execute(delete(KBChunk))
+    db.execute(delete(KBDocument))
+    if is_postgres():
+        try:
+            db.execute(sql_text("ALTER TABLE kb_chunks DROP COLUMN embedding"))
+            db.execute(sql_text(
+                f"ALTER TABLE kb_chunks ADD COLUMN embedding "
+                f"vector({settings.EMBEDDING_DIM})"))
+        except Exception:
+            db.rollback()
+            logger.exception("Could not resize pgvector column — RAG will keep "
+                             "the old dimension until the volume is wiped.")
+            return False
+    db.commit()
+    ingest_kb(db)
+    return True

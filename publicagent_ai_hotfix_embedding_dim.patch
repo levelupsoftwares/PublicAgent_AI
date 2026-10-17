@@ -1,0 +1,358 @@
+diff --git a/.env.example b/.env.example
+index b642af6..c551b5b 100755
+--- a/.env.example
++++ b/.env.example
+@@ -38,13 +38,16 @@ GROQ_MODEL_NAME=qwen/qwen3-32b
+ OPENROUTER_API_KEY=
+ OPENROUTER_BASE_URL=https://openrouter.ai/api/v1
+ EMBEDDING_MODEL_NAME=nvidia/nemotron-3-embed-1b:free
+-# IMPORTANT: EMBEDDING_DIM must match the model's output dimension. If you see
+-# "vector dimension mismatch" errors at startup, either:
+-#   - change EMBEDDING_DIM to match the model, OR
+-#   - pick a different EMBEDDING_MODEL_NAME that already produces this dimension,
+-#   - AND wipe the docker volume (docker compose down -v) so pgvector recreates
+-#     the kb_chunks.embedding column at the new width on first boot.
+-EMBEDDING_DIM=1024
++# IMPORTANT: EMBEDDING_DIM must match the model's REAL output dimension.
++# nvidia/nemotron-3-embed-1b:free currently returns 2048-dim vectors — the
++# old default of 1024 crashed fresh installs with pgvector's
++# "expected 1024 dimensions, not 2048". The backend now PROBES the API on
++# boot and auto-reconciles the schema, so a wrong value no longer crashes
++# startup — but set it correctly to skip the extra re-embedding work.
++# After changing the dimension, wipe the docker volume (docker compose down -v)
++# so pgvector recreates the kb_chunks.embedding column at the new width on
++# first boot (the boot-time reconciler also does this automatically).
++EMBEDDING_DIM=2048
+ 
+ # --- Google Gemini (chat + embeddings, or embeddings only) ---------------------
+ # Get a key at https://aistudio.google.com/apikey
+diff --git a/DECISIONS.md b/DECISIONS.md
+index 3e471b1..91ad6f3 100755
+--- a/DECISIONS.md
++++ b/DECISIONS.md
+@@ -164,3 +164,21 @@ decided and why*.
+     wrong width — SQLite silently returns empty RAG results, pgvector raises
+     dimension-mismatch errors. Startup now detects the drift, wipes and
+     re-embeds the KB automatically (PostgreSQL column is recreated).
++
++## Hotfix: embedding-dimension reconciliation (MVP patch 3)
++
++28. **Boot-time dimension probe** (`reconcile_embedding_dimension`): a fresh
++    install with `EMBEDDING_DIM=1024` crashed because the OpenRouter model
++    (`nvidia/nemotron-3-embed-1b:free`) actually returns 2048-dim vectors —
++    pgvector rejected every insert ("expected 1024 dimensions, not 2048") and
++    the backend exited before serving a single request. The stored-row drift
++    heal can't see this on an empty database, so startup now asks the live
++    embedding API for ONE probe vector, trusts that width, recreates the
++    pgvector column at the real dimension, adopts the dimension in-process
++    and re-ingests. A loud log line tells the operator to fix EMBEDDING_DIM
++    in .env to make it permanent. `.env.example` default corrected to 2048.
++29. **KB ingestion is non-fatal at boot**: if the embedding API is down or
++    over quota, the backend now boots with an empty knowledge base and a
++    logged error instead of exiting (chat/agent keep working; guidance
++    answers just lack citations). `/api/health` now also reports the
++    effective `embedding_dim` for quick diagnosis.
+diff --git a/README.md b/README.md
+index b12f1a8..a6966d4 100755
+--- a/README.md
++++ b/README.md
+@@ -46,11 +46,13 @@ Out of the box the `.env` is wired for `LLM_PROVIDER=groq`:
+ > closest available Qwen3 model on Groq is `qwen/qwen3-32b` (the default). To
+ > use a different Groq-hosted Qwen, override `GROQ_MODEL_NAME` in `.env`.
+ 
+-> **Embedding dimension:** `EMBEDDING_DIM=1024` matches the default
+-> `nvidia/nemotron-3-embed-1b:free` model. If you swap to a different
+-> embedding model, change `EMBEDDING_DIM` to match AND wipe the postgres
+-> volume (`docker compose down -v`) so the `kb_chunks.embedding` column is
+-> recreated at the new width on first boot.
++> **Embedding dimension:** `EMBEDDING_DIM=2048` matches the default
++> `nvidia/nemotron-3-embed-1b:free` model. The backend **probes the embedding
++> API on every boot** and auto-reconciles when the real output width differs
++> from `EMBEDDING_DIM` — it wipes and re-embeds the knowledge base and
++> recreates the pgvector column at the correct width — so a stale dimension
++> logs a warning instead of crashing startup. Set `EMBEDDING_DIM` correctly
++> anyway to skip the extra re-embedding work on each boot.
+ 
+ ### Google Gemini (chat + embeddings)
+ 
+diff --git a/backend/app/main.py b/backend/app/main.py
+index 0d8709a..94f021e 100755
+--- a/backend/app/main.py
++++ b/backend/app/main.py
+@@ -46,22 +46,39 @@ def _startup() -> None:
+         Base.metadata.create_all(bind=engine)  # idempotent
+ 
+     # Demo knowledge base + seed data on first boot.
+-    from app.rag.ingest import ingest_kb, reingest_if_dim_changed
++    from app.rag.ingest import (ingest_kb, reconcile_embedding_dimension,
++                                reingest_if_dim_changed)
+     from app.api.auth import ensure_demo_user
+ 
+     db = SessionLocal()
+     try:
+-        # If EMBEDDING_PROVIDER / EMBEDDING_DIM changed since the last run,
+-        # stored KB chunks have the wrong width and RAG silently returns
+-        # nothing (SQLite) or inserts fail (pgvector). Heal before anything
+-        # else touches the KB.
++        # 1) Probe the LIVE embedding API. If the model's real output width
++        #    differs from EMBEDDING_DIM (wrong default, provider changed the
++        #    model, key/model swap), reconcile schema + settings BEFORE any
++        #    insert — otherwise pgvector rejects every chunk ("expected N
++        #    dimensions, not M") and startup dies. Also repairs a KB that was
++        #    ingested under an older dimension.
++        configured_dim = settings.EMBEDDING_DIM
++        effective_dim = reconcile_embedding_dimension(db)
++        if effective_dim and effective_dim != configured_dim:
++            logger.info("Effective embedding dimension: %s (was configured as %s)",
++                        effective_dim, configured_dim)
+         if reingest_if_dim_changed(db):
+             logger.info("Knowledge base re-ingested after embedding-dimension change")
++        # 2) First-boot ingestion. A failure here (embedding API down, quota,
++        #    bad key) must NOT kill the whole backend — the app boots with an
++        #    empty KB and RAG simply returns no citations until it recovers.
+         if not inspect(engine).has_table("kb_chunks") or db.execute(
+             __import__("sqlalchemy").text("SELECT COUNT(*) FROM kb_chunks")
+         ).scalar() == 0:
+-            stats = ingest_kb(db)
+-            logger.info("Knowledge base ingested: %s", stats)
++            try:
++                stats = ingest_kb(db)
++                logger.info("Knowledge base ingested: %s", stats)
++            except Exception:
++                db.rollback()
++                logger.exception("Knowledge base ingestion failed — continuing "
++                                 "with an EMPTY knowledge base (guidance answers "
++                                 "will lack citations until this succeeds).")
+         ensure_demo_user(db)
+         db.commit()
+     finally:
+@@ -131,6 +148,7 @@ def health():
+         "status": "ok",
+         "env": settings.ENV,
+         "llm_provider": get_llm_client().provider_name,
++        "embedding_dim": settings.EMBEDDING_DIM,
+         "database": engine.dialect.name,
+         "notice": "All government data in this app is demo/mock data.",
+     }
+diff --git a/backend/app/rag/ingest.py b/backend/app/rag/ingest.py
+index d389688..10b561e 100755
+--- a/backend/app/rag/ingest.py
++++ b/backend/app/rag/ingest.py
+@@ -258,8 +258,6 @@ def reingest_if_dim_changed(db: Session) -> bool:
+     if they differ, wipe kb_documents/kb_chunks (PostgreSQL: recreate the
+     fixed-width vector column) and re-ingest with the current provider.
+     """
+-    from sqlalchemy import text as sql_text
+-
+     row = db.execute(select(KBChunk).limit(1)).scalars().first()
+     if row is None or row.embedding is None:
+         return False  # nothing ingested yet (or no embeddings) — nothing to heal
+@@ -275,19 +273,88 @@ def reingest_if_dim_changed(db: Session) -> bool:
+         "Embedding dimension drift detected: stored chunks have dim=%s but "
+         "EMBEDDING_DIM=%s — wiping and re-ingesting the knowledge base.",
+         stored_len, settings.EMBEDDING_DIM)
++    if not _wipe_kb(db, resize_to=None):
++        return False
++    ingest_kb(db)
++    return True
++
++
++def _wipe_kb(db: Session, resize_to: int | None) -> bool:
++    """Wipe all KB rows; optionally recreate the pgvector column at new width.
++
++    Returns True on success. `resize_to=None` keeps the column as-is
++    (SQLite stores JSON, so only Postgres needs a schema change).
++    """
++    from sqlalchemy import text as sql_text
++
+     db.execute(delete(KBChunk))
+     db.execute(delete(KBDocument))
+-    if is_postgres():
++    if resize_to is not None and is_postgres():
+         try:
+-            db.execute(sql_text("ALTER TABLE kb_chunks DROP COLUMN embedding"))
++            db.execute(sql_text("ALTER TABLE kb_chunks DROP COLUMN IF EXISTS embedding"))
+             db.execute(sql_text(
+-                f"ALTER TABLE kb_chunks ADD COLUMN embedding "
+-                f"vector({settings.EMBEDDING_DIM})"))
++                f"ALTER TABLE kb_chunks ADD COLUMN embedding vector({resize_to})"))
+         except Exception:
+             db.rollback()
+-            logger.exception("Could not resize pgvector column — RAG will keep "
+-                             "the old dimension until the volume is wiped.")
++            logger.exception("Could not resize pgvector column to %s — wipe the "
++                             "docker volume (docker compose down -v) to fix manually.",
++                             resize_to)
+             return False
+     db.commit()
+-    ingest_kb(db)
+     return True
++
++
++def reconcile_embedding_dimension(db: Session) -> int | None:
++    """Probe the live embedding API and reconcile EMBEDDING_DIM + the schema.
++
++    Catches the fresh-install crash pgvector reports as::
++
++        psycopg.errors.DataException: expected 1024 dimensions, not 2048
++
++    This happens when the configured embedding model's real output width
++    differs from EMBEDDING_DIM (wrong default in .env, provider changed the
++    model, or user swapped EMBEDDING_MODEL_NAME without updating the dim).
++    The stored-drift heal (reingest_if_dim_changed) cannot see it on an empty
++    database — there are no rows to compare yet — so at boot we ask the
++    provider itself for one vector and trust that answer:
++
++    1. probe the API with a single tiny string → actual dimension
++    2. if it differs from settings.EMBEDDING_DIM: wipe the KB, recreate the
++       pgvector column at the actual width (Postgres), adopt the actual
++       dimension in-process, and re-ingest
++    3. log a loud hint to also update EMBEDDING_DIM in .env
++
++    Returns the effective dimension (int) or None when the probe failed
++    (offline / bad key) — the caller decides whether boot can continue.
++    """
++    llm = get_llm_client()
++    try:
++        probe = llm.embed(["embedding dimension probe"])
++        actual = len(probe[0]) if probe and probe[0] else 0
++    except Exception:
++        logger.exception(
++            "Embedding dimension probe failed — skipping reconciliation. "
++            "RAG will stay empty until the embedding backend is reachable.")
++        return None
++    if not actual:
++        logger.error("Embedding probe returned an empty vector — skipping "
++                     "reconciliation.")
++        return None
++
++    if actual == settings.EMBEDDING_DIM:
++        return actual
++
++    logger.warning(
++        "EMBEDDING_DIM=%s but the active embedding backend returns "
++        "%s-dimensional vectors — reconciling the schema and re-embedding "
++        "the knowledge base. Update EMBEDDING_DIM=%s in .env to make this "
++        "fix permanent and skip the extra work on future boots.",
++        settings.EMBEDDING_DIM, actual, actual)
++
++    # Fresh DB → table exists at the stale width with no rows; DB with data →
++    # rows have the old width. Both are fixed by: wipe + resize + re-ingest.
++    if not _wipe_kb(db, resize_to=actual):
++        return None
++    settings.EMBEDDING_DIM = actual  # adopt in-process (mock/gemini read it live)
++    ingest_kb(db)
++    return actual
+diff --git a/backend/tests/test_embedding_dim_reconcile.py b/backend/tests/test_embedding_dim_reconcile.py
+new file mode 100755
+index 0000000..de84aae
+--- /dev/null
++++ b/backend/tests/test_embedding_dim_reconcile.py
+@@ -0,0 +1,107 @@
++"""Tests for boot-time embedding-dimension reconciliation (hotfix patch 3).
++
++Regression context: a fresh install with EMBEDDING_DIM=1024 crashed at startup
++with pgvector's "expected 1024 dimensions, not 2048" because the configured
++OpenRouter model returns 2048-dim vectors. The reconciler must adopt the API's
++real dimension, re-ingest the KB at that width, and never let a probe failure
++crash the app.
++"""
++from __future__ import annotations
++
++import pytest
++
++from sqlalchemy import func, select
++
++from app.config import settings
++from app.models import KBChunk
++
++
++@pytest.fixture()
++def restore_dim():
++    """Preserve EMBEDDING_DIM across tests that mutate it."""
++    original = settings.EMBEDDING_DIM
++    yield
++    settings.EMBEDDING_DIM = original
++
++
++def _stub_llm(dim: int):
++    class _Stub:
++        provider_name = "stub"
++
++        def generate(self, messages, *, system=None, json_mode=False):
++            raise NotImplementedError
++
++        def embed(self, texts):
++            return [[0.5] * dim for _ in texts]
++
++    return _Stub()
++
++
++def test_reconcile_adopts_api_dimension(db, restore_dim, monkeypatch):
++    """API returns 8-dim while EMBEDDING_DIM=4 → adopt 8, re-ingest at 8."""
++    import app.rag.ingest as ingest_mod
++    from app.rag.ingest import ingest_kb, reconcile_embedding_dimension
++
++    settings.EMBEDDING_DIM = 4
++    ingest_kb(db)
++    assert db.execute(select(func.count()).select_from(KBChunk)).scalar() > 0
++
++    monkeypatch.setattr(ingest_mod, "get_llm_client", lambda: _stub_llm(8))
++    effective = reconcile_embedding_dimension(db)
++
++    assert effective == 8
++    assert settings.EMBEDDING_DIM == 8
++    for ch in db.execute(select(KBChunk)).scalars():
++        assert len(list(ch.embedding)) == 8
++    assert db.execute(select(func.count()).select_from(KBChunk)).scalar() > 0
++
++
++def test_reconcile_noop_when_dim_matches(db, restore_dim, monkeypatch):
++    """Probe agrees with EMBEDDING_DIM → no wipe, chunk ids unchanged."""
++    import app.rag.ingest as ingest_mod
++    from app.rag.ingest import ingest_kb, reconcile_embedding_dimension
++
++    settings.EMBEDDING_DIM = 6
++    ingest_kb(db)
++    ids_before = {c.id for c in db.execute(select(KBChunk)).scalars()}
++
++    monkeypatch.setattr(ingest_mod, "get_llm_client", lambda: _stub_llm(6))
++    assert reconcile_embedding_dimension(db) == 6
++
++    ids_after = {c.id for c in db.execute(select(KBChunk)).scalars()}
++    assert ids_before == ids_after
++
++
++def test_reconcile_survives_probe_failure(db, restore_dim, monkeypatch):
++    """Embedding API down → return None, no exception, app can still boot."""
++    import app.rag.ingest as ingest_mod
++    from app.rag.ingest import reconcile_embedding_dimension
++
++    class _Broken:
++        provider_name = "broken"
++
++        def generate(self, messages, *, system=None, json_mode=False):
++            raise NotImplementedError
++
++        def embed(self, texts):
++            raise RuntimeError("embedding API unreachable")
++
++    monkeypatch.setattr(ingest_mod, "get_llm_client", lambda: _Broken())
++    assert reconcile_embedding_dimension(db) is None
++
++
++def test_stored_drift_heal_still_works(db, restore_dim, monkeypatch):
++    """reingest_if_dim_changed: stored 4-dim rows vs EMBEDDING_DIM=8 → healed."""
++    import app.rag.ingest as ingest_mod
++    from app.rag.ingest import ingest_kb, reingest_if_dim_changed
++
++    settings.EMBEDDING_DIM = 4
++    ingest_kb(db)
++
++    # .env "changed" to 8 and the API agrees (probe = 8) — stored rows are stale.
++    settings.EMBEDDING_DIM = 8
++    monkeypatch.setattr(ingest_mod, "get_llm_client", lambda: _stub_llm(8))
++    assert reingest_if_dim_changed(db) is True
++
++    for ch in db.execute(select(KBChunk)).scalars():
++        assert len(list(ch.embedding)) == 8
