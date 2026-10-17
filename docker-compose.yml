@@ -37,7 +37,7 @@ services:
       # IMPORTANT: nemotron-3-embed-1b outputs 2048-dim vectors. Keep this at
       # 2048 unless you switch to a different embedding model, and wipe the
       # pgdata volume (docker compose down -v) when changing the dimension.
-      EMBEDDING_DIM: ${EMBEDDING_DIM:-2048}
+      EMBEDDING_DIM: ${EMBEDDING_DIM:-1024}
       # --- Aliyun Model Studio (fallback provider, unused in default) ----
       DASHSCOPE_API_KEY: ${DASHSCOPE_API_KEY:-}
       # --- Auth ----------------------------------------------------------
